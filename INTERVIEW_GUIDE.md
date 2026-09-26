@@ -1,485 +1,651 @@
-# Interview Guide — Deep Explanation of This Project
+# Interview Guide: AI Account Intelligence & Next-Best-Action Engine
 
-This is written so you can defend every design decision under follow-up
-questioning, not just describe what the app does. Read section 1 first — it's
-the script. Everything after it is ammunition for "why did you..." questions.
+How to use this guide:
 
----
-
-## 1. How to open (30–45 seconds, memorize the shape not the words)
-
-> "I built a B2B account intelligence tool — think of it as the engine behind
-> something like 6sense or an ABM platform. Sales reps have too many accounts
-> to track manually, so the product ingests behavioral signals — website
-> visits, email engagement, demo requests, hiring activity — and produces
-> three things for each account: an **explainable 0-to-100 score** computed
-> by a deterministic rules engine, a **plain-English explanation of what
-> changed since yesterday and why**, and a **next-best-action recommendation**
-> like 'contact this VP, here's why, here's what to say.' The scoring and the
-> action logic are pure backend rules — I deliberately did *not* let an LLM
-> touch the numbers, because a sales VP won't trust a score they can't audit.
-> The LLM's only job is to read that structured evidence and write the
-> human-facing summary and outreach email, with hard grounding rules so it
-> can't invent people or facts. And the whole thing degrades gracefully — if
-> the AI provider is down, every other feature keeps working."
-
-Then stop talking and let them ask questions. Don't dump the whole README.
+- **Sections 1–3** are what you *say*: the plain-language explanation, the
+  opening script, and how the system works end to end. Know these cold.
+- **Section 4** is the live demo script.
+- **Sections 5–15** are the ammunition for "why did you…" follow-ups.
+- **Section 18** is a one-page cheat sheet of every number worth remembering.
 
 ---
 
-## 1b. The live demo (5–7 minutes): show, don't tell
+## 1. The project in plain words
+
+**The problem.** A B2B sales rep owns dozens or hundreds of company accounts.
+Every day those companies leave small traces: someone visits the pricing
+page, opens an email, downloads a whitepaper, requests a demo, or the
+company posts six engineering jobs. No human can watch all of that. So reps
+either chase the wrong accounts or miss the one that's ready to buy.
+
+**What the product does.** It collects those traces ("signals") per account
+and answers two questions for the rep:
+
+1. **Which account should I focus on right now?** Every account gets a
+   **0–100 score** and a **HIGH / MEDIUM / LOW priority**.
+2. **What should I do next?** Every account gets a **next best action**
+   (schedule a demo, contact a decision-maker, send a personalized email,
+   nurture, or monitor), a **named person to contact**, and an
+   **AI-written summary and outreach draft**.
+
+On top of that, it explains itself:
+
+- **Score breakdown:** exactly which rules produced each point.
+- **What changed?** "Acme went 61 → 86 (+25) since yesterday, and here are
+  the four timestamped signals that caused it."
+- **Timeline:** every signal, including the ones that were ignored and why.
+
+**The one sentence to remember:**
+> *Rules decide the numbers and the action; AI only writes the words, and
+> only from facts the rules already computed.*
+
+**Who would use it:** sales reps (daily focus list), sales managers
+(pipeline review: "why is this account HIGH?"), and marketing (which
+campaigns create real buying intent vs. noise).
+
+---
+
+## 2. How to open (30–45 seconds, memorize the shape not the words)
+
+> "I built a B2B account intelligence tool, the kind of engine behind ABM
+> platforms like 6sense. Sales reps have too many accounts to track
+> manually, so the product ingests behavioral signals (website visits,
+> email engagement, demo requests, hiring activity) and produces three
+> things for each account: an **explainable 0-to-100 score** from a
+> deterministic rules engine, a **plain-English explanation of what changed
+> since yesterday and why**, and a **next-best-action recommendation** like
+> 'contact this VP, here's why, here's what to say.'
+>
+> The scoring and the action logic are pure backend rules. I deliberately
+> did *not* let an LLM touch the numbers, because a sales VP won't trust a
+> score they can't audit. The LLM's only job is to read that structured
+> evidence and write the summary and outreach email, with hard grounding
+> rules so it can't invent people or facts. If the AI provider is down,
+> every other feature keeps working.
+>
+> It's React and TypeScript on the front, FastAPI and SQLite on the back,
+> 113 backend tests, and it's deployed on Vercel and Render."
+
+Then stop talking and let them ask questions.
+
+---
+
+## 3. How the system works end to end
+
+### 3.1 Architecture
+
+```
+ Browser (React + TypeScript, Vite build)
+    │  fetch /api/...            ← never sees the OpenRouter key
+    ▼
+ Vercel  ── serves the static site; rewrites /api/* to the backend
+    │
+    ▼
+ Render  ── FastAPI (Python 3.12)
+    │        routes/accounts.py      HTTP layer, validation (Pydantic)
+    │        services/scoring.py     Fit + Intent + Engagement + Recency
+    │        services/changes.py     "What changed?" attribution
+    │        services/personas.py    job title → persona, contact ranking
+    │        services/product_interest.py
+    │        services/recommendations.py   next-best-action rules
+    │        services/intelligence.py      assembles all of the above
+    │        services/ai_analyst.py        OpenRouter call + grounding
+    ├──► SQLite (SQLAlchemy): accounts, contacts, activities, score snapshots
+    └──► OpenRouter (openrouter/free) ── only on "Analyze Account"
+```
+
+**Data model (four tables):**
+
+| Table | Holds | Notable detail |
+|---|---|---|
+| `accounts` | company name, industry, employee count, website | feeds the Fit score |
+| `contacts` | people at the account + job title | title → persona |
+| `activities` | every signal: type, timestamp, metadata | unique `dedupe_key` blocks duplicates |
+| `account_scores` | score snapshots over time | powers history and "What changed?" |
+
+### 3.2 What happens when you open an account page
+
+1. The browser requests `GET /api/accounts/1/intelligence`.
+2. FastAPI loads the account, its contacts and its activities.
+3. **Scoring** (`scoring.py`) is a pure function of (account, activities,
+   now). It drops future-dated and duplicate signals, keeps the last 30
+   days, applies per-type caps, and returns Fit/Intent/Engagement/Recency
+   with a human-readable reason for every point.
+4. **Snapshot sync:** if the live score differs from the latest stored
+   snapshot, a new snapshot is written. That's how score history builds up.
+5. **What changed?** (`changes.py`) finds the snapshot from at least 24h ago
+   and explains the difference, driver by driver, summing exactly to the
+   delta.
+6. **Personas** (`personas.py`) map each contact's title to a persona and
+   rank contacts, boosting anyone who personally engaged.
+7. **Product interest** (`product_interest.py`) guesses the product line,
+   or says "Insufficient signals" if the evidence is thin or tied.
+8. **Next best action** (`recommendations.py`) walks an ordered rule list;
+   the first matching rule wins.
+9. Everything is returned as one JSON response (camelCase), and React
+   renders the header, breakdown chart, What Changed, timeline, contacts
+   and action card.
+
+No AI has been called at this point. The whole page is deterministic.
+
+### 3.3 What happens when you click "Analyze Account"
+
+1. `POST /api/accounts/1/analyze`.
+2. The backend builds a **structured JSON payload**: account facts, the
+   score and its maximums, up to 15 scored activities, the real contacts,
+   the likely product, the score change, and the *already decided* next
+   action.
+3. It sends that with a strict system prompt to OpenRouter. The key lives
+   only in the backend's environment.
+4. It parses the reply defensively, validates it with Pydantic, applies a
+   post-check (for example, no contacts means no persona gets named), and
+   returns it.
+5. On any failure it retries once if the error is transient, then returns
+   HTTP 200 with `status: "unavailable"` and the UI shows a calm fallback.
+   The score and action are still on screen.
+
+### 3.4 What happens when you log a new signal
+
+1. `POST /api/accounts/{id}/activities` with a type, timestamp and metadata.
+2. A dedupe fingerprint is computed. If it already exists → **409
+   Conflict** ("This exact signal was already recorded").
+3. Otherwise → **201**, the account is rescored, a snapshot is written, and
+   the response carries the before/after score, which the UI shows as a
+   toast: *"Score 17 → 52 (+35). Priority is now MEDIUM…"*
+
+---
+
+## 4. The live demo (5–7 minutes): show, don't tell
+
+**Where to run it:**
+- **Deployed:** open the Vercel link (under *Domains* in the Vercel project).
+  **Open it a minute early.** The free Render backend sleeps after ~15
+  minutes idle and takes 30–60 seconds to wake. Each restart reloads fresh
+  demo data, so "today" and "yesterday" are always correct.
+- **Local:** run the backend (`uvicorn app.main:app --port 8000`) and the
+  frontend (`npm run dev`), then open `http://localhost:5173`. Reseed first
+  (`python -m app.seed`) so the relative dates are fresh.
 
 The app has three places: **Overview** (`/`, explains how it thinks),
 **Accounts dashboard** (`/accounts`), and an **account page**
-(`/accounts/:id`). Reseed first (`python -m app.seed`) so "today" and
-"yesterday" are accurate.
+(`/accounts/:id`).
 
 **Part 1: the Overview page (≈2 min). This proves you understand the product.**
 
-1. Open `http://localhost:5173`. Read the headline question out loud:
-   *"Which account should sales focus on right now, and what should they do
-   next?"* Point at the floating live card: *"This is real data. Acme moved
-   +25 since yesterday."*
+1. Read the headline question out loud: *"Which account should sales focus
+   on right now, and what should they do next?"* Point at the floating live
+   card: *"This is real data. Acme moved +25 since yesterday."*
 2. Scroll to **How it works**. Let the 7-step walkthrough auto-play, or click
-   steps 2 → 3 → 6 → 7. Say: *"Six of these seven steps are deterministic. Only
-   the last one uses AI, and every step here is showing live data from the
-   backend, not a mockup."*
+   steps 2 → 3 → 6 → 7. Say: *"Six of these seven steps are deterministic.
+   Only the last one uses AI, and every step shows live backend data, not a
+   mockup."*
 3. Scroll to the **score simulator**, the highest-impact minute of the demo:
-   - Click **Acme · yesterday** → **61**. *"Marketing engagement only, no
-     buying intent."*
-   - Click **Acme · today** → **86**. *"Add a pricing visit, a technical doc,
-     a hiring signal and VP engagement. That's the +25, and the next action
+   - **Acme · yesterday** → **61**. *"Marketing engagement only, no buying
+     intent."*
+   - **Acme · today** → **86**. *"Add a pricing visit, a technical doc, a
+     hiring signal and VP engagement. That's the +25, and the next action
      flips to Contact decision-maker."*
-   - Click **Bot spam** → **41**. *"240 fake signals, but the per-type caps
-     count only 2 of 40 pricing views and 5 of 200 visits. This is why you
-     can't game it."*
-   - Turn off *Decision-maker contact on file* on the Acme preset and point
-     out the action falls back to *Send personalized email*.
+   - **Bot spam** → **41**. *"240 fake signals, but the per-type caps count
+     only 2 of 40 pricing views and 5 of 200 visits. You can't game it."*
+   - Turn off *Decision-maker contact on file* on the Acme preset: the
+     action falls back to *Send personalized email*.
 
 **Part 2: the real product (≈3 min).**
 
 4. Click **Open live dashboard**. Point at the **Focus now** banner and the
    priority cards. **Hover** a row: *"a preview with the breakdown and top
-   changes, loaded lazily and cached."* Change **Sort** to *Score change* and
-   let them see the rows animate into place.
+   changes, loaded lazily and cached."* Change **Sort** to *Score change*
+   and let them watch the rows animate into place.
 5. Open **Acme Technologies**. Show **What changed?**: 61 → 86 and the four
    drivers. **Click a driver**: the timeline jumps to that exact event and
    highlights it. *"Every point is traceable to a real, timestamped signal."*
-6. Click **Intent** next to the score ring. The breakdown card flashes and
-   shows exactly which rules produced 16/30.
-7. Point at **Who should I contact?** (Sarah Chen, Technical Evaluator,
-   engaged) and the **Next best action** card.
+6. Click **Intent** next to the score ring. The breakdown card shows exactly
+   which rules produced the intent points.
+7. Point at **Who should I contact?** and the **Next best action** card.
 8. Click **Analyze Account**. While it loads: *"Now I hand that structured
-   evidence to an LLM and ask for the summary and outreach draft, but it
-   never touches the score."* Show the result and the *AI-generated
-   analysis* label.
+   evidence to an LLM for the summary and outreach draft, but it never
+   touches the score."* Show the result and its *AI-generated analysis*
+   label. (Free models can take 5–40 seconds. If it fails, that's a demo of
+   the fallback, so say so.)
 
 **Part 3: prove it's live, not scripted (≈1 min).**
 
 9. Press **Ctrl+K**, type `keystone`, Enter. Score **17**, *Monitor account*.
 10. Click **Log a signal** → **Demo request** → submit. The toast reads
-    *"Score 17 → 52 (+35). Priority is now MEDIUM. Next best action: Schedule
-    demo…"* *"The real backend just rescored the account, wrote a snapshot,
-    and recomputed What Changed."*
-11. Submit the same signal again: *"This exact signal was already recorded."*
-    *"Duplicates are rejected at the database level, so a retried webhook
-    can't inflate a score."*
-12. (Optional) Click the theme icon to show dark mode. Open **Cobalt Security
-    Labs** or **Lumen Media Co** to show the honest empty states.
+    *"Score 17 → 52 (+35). Priority is now MEDIUM. Next best action:
+    Schedule demo…"* *"The real backend just rescored the account, wrote a
+    snapshot, and recomputed What Changed."*
+11. Submit the same signal again: *"This exact signal was already
+    recorded."* *"Duplicates are rejected at the database level, so a
+    retried webhook can't inflate a score."*
+12. (Optional) Toggle dark mode. Open **Cobalt Security Labs** or **Lumen
+    Media Co** to show the honest empty states.
 
-If you're short on time, do steps 3, 5 and 10. That's scoring, explainability
-and live rescoring in under two minutes.
+Short on time? Do steps 3, 5 and 10: scoring, explainability and live
+rescoring in under two minutes.
 
 ---
 
-## 2. The "why" behind the single biggest design decision
+## 5. The single biggest design decision
 
 **Decision: separate deterministic scoring from AI generation.**
 
-If asked "why didn't you just have GPT/Claude score the account?" — this is
-the answer that shows product judgment, not just coding ability:
+If asked "why didn't you just have an LLM score the account?":
 
-- **Auditability.** A VP of Sales reviewing a pipeline forecast needs to be
-  able to point at a number and defend it in a QBR. "The LLM said 86" is not
-  a defensible answer. "Fit 30/30 because they're in our target industry and
-  size range, Intent 16/30 from a pricing visit + hiring signal, Engagement
-  20/20 from a VP directly engaging" is defensible.
-- **Determinism / reproducibility.** Run the same activity data through the
-  scorer twice, get the same number. LLMs are non-deterministic even at
-  temperature 0 in practice (different tokenization, provider-side sampling
-  quirks). You cannot build a trustworthy dashboard on a non-reproducible
-  number.
-- **Cost and latency.** Scoring 10,000 accounts nightly via an LLM call each
-  is slow and expensive. A pure-Python function is microseconds and free.
-- **Testability.** I have 113 unit tests asserting exact score values (e.g.
-  "given these activities, fit=30, intent=16, total=86"). You cannot write
-  that test against an LLM's output.
-- **Where AI *does* add value:** turning "Fit 30, Intent 16, Engagement 20"
-  into a paragraph a human enjoys reading, and drafting personalized prose
-  that references the *specific* evidence — that's a genuine LLM strength
-  (synthesis and tone), and a genuine rules-engine weakness.
+- **Auditability.** A VP of Sales needs to defend a number in a pipeline
+  review. "The LLM said 86" isn't defensible. "Fit 30/30 because they're in
+  our target industry and size range, Intent from a pricing visit and a
+  hiring signal, Engagement from a VP engaging directly" is.
+- **Reproducibility.** Same data in, same score out, every time. LLM output
+  varies between runs, and you can't build a trustworthy dashboard on a
+  number that changes when you refresh.
+- **Cost and latency.** Scoring 10,000 accounts nightly with an LLM call
+  each is slow and expensive. A pure Python function is microseconds and
+  free.
+- **Testability.** 113 tests assert exact values ("given these activities,
+  total = 86"). You can't write that test against an LLM.
+- **Where AI *does* add value:** turning numbers into a paragraph a human
+  wants to read, and drafting outreach that references the specific
+  evidence. That's synthesis and tone, a real LLM strength and a real
+  rules-engine weakness.
 
-This is the single most important thing to communicate: **I used AI where it
-has comparative advantage (language) and rules where correctness and trust
-matter (numbers and decisions).**
+**The takeaway:** *AI where it has the advantage (language), rules where
+correctness and trust matter (numbers and decisions).*
 
 ---
 
-## 3. Walk through the scoring formula like you designed it from scratch
+## 6. The scoring formula, explained like you designed it
 
 ```
 Total (0–100) = Fit (0–30) + Intent (0–30) + Engagement (0–20) + Recency (0–20)
+Priority: HIGH 80–100 · MEDIUM 50–79 · LOW 0–49
 ```
 
-Be ready to explain *why these four buckets and why these weights*:
+**Fit (30): could they ever buy from us?**
+- +15 if the industry is a target (Technology, Financial Services,
+  Healthcare, Manufacturing).
+- +15 if the company has 200–5,000 employees.
+- Capped at 30 on purpose: a perfect-fit account that has never engaged
+  should not outrank an average-fit account requesting a demo today.
 
-- **Fit (30 pts)** — firmographic match to the Ideal Customer Profile
-  (industry in {Technology, Financial Services, Healthcare, Manufacturing},
-  size 200–5,000 employees). This answers "*could* they ever buy from us,"
-  independent of behavior. It's capped at 30 because fit alone should never
-  make an account "hot" — a perfect-fit account that's never engaged is not
-  more urgent than an imperfect-fit account requesting a demo today.
-- **Intent (30 pts)** — explicit buying signals: pricing page views (8pts),
-  demo requests (15pts, the strongest single signal), content downloads,
-  and — a deliberate choice — **hiring/expansion activity counts as intent**
-  (a company hiring 6 cloud engineers is a real buying trigger, not just
-  "engagement"). Each signal type has a **per-type cap** (e.g. only the
-  first 2 pricing views count) specifically to defeat gaming — otherwise a
-  bot or an over-eager marketer refreshing a page 50 times would push a
-  cold account to HIGH priority.
-- **Engagement (20 pts)** — softer signals (email opens/clicks, website
-  visits) plus a heavily-weighted signal: **decision-maker engagement (8
-  pts)**. A VP opening your product page is worth more than a random visitor
-  doing the same thing — but I only know it's a VP because I cross-reference
-  the activity's contact metadata against the persona-mapped contact list.
-- **Recency (20 pts)** — a step function (24h=20, 3d=15, 7d=10, 14d=5,
-  older=0) rather than a smooth decay curve. I chose steps over decay for
-  *interpretability*: "recency is 15 because the last real activity was 2
-  days ago" is instantly understandable in a UI tooltip; a continuous decay
-  formula is not. **Email opens are explicitly excluded from recency** —
-  they're notoriously unreliable (Apple Mail Privacy Protection and other
-  proxies auto-open tracking pixels), so I don't want a bot-triggered pixel
-  making a dead account look "fresh."
+**Intent (30): are they showing buying behaviour?** Points per signal, and
+the maximum number of that signal type that counts:
 
-Priority bands (HIGH 80-100 / MEDIUM 50-79 / LOW 0-49) are a simple
-threshold — if asked "how did you pick 80/50," the honest answer is "these
-are reasonable, configurable defaults for a demo; in production I'd back-test
-thresholds against actual win-rates by score decile."
+| Signal | Points | Counts at most |
+|---|---|---|
+| Demo request | 15 | 1 |
+| Pricing page view | 8 | 2 |
+| Product page view | 4 | 3 |
+| Content download | 3 | 3 |
+| Hiring activity | 5 | 1 |
+| Company expansion | 5 | 1 |
 
----
+Hiring and expansion count as **intent** deliberately: a company hiring six
+cloud engineers is a real buying trigger, not just "engagement."
 
-## 4. Be ready to explain "What Changed?" — this is the most technically interesting part
+**Engagement (20): are they paying attention to us?**
 
-The naive way to build "what changed" is to just diff two numbers. I built
-**exact point-by-point attribution** instead — every score delta is broken
-into named drivers (e.g. "+8 Pricing page visit, +6 VP Engineering
-engagement, +5 Hiring activity") that **mathematically sum to the real
-delta**. This is harder than it sounds because of *interaction effects*:
+| Signal | Points | Counts at most |
+|---|---|---|
+| Decision-maker engagement | 8 | 2 |
+| Email click | 4 | 2 |
+| Content download | 3 | 3 |
+| Email open | 2 | 3 |
+| Website visit | 1 | 5 |
 
-- If an account already has 2 pricing-page views counted (hitting the
-  per-type cap) and a 3rd comes in, that 3rd view contributes **0 points** —
-  but it still needs to *appear* in the timeline with an honest explanation
-  ("limited by score caps"), not silently disappear.
-- Signals can **age out** of the 30-day rolling window between yesterday and
-  today, which can make the score go *down* even with new positive activity
-  — I attribute that separately as "older signals aged out."
-- I recompute what *yesterday's* score would have been using the exact same
-  scoring function with `as_of=yesterday`, rather than trusting a possibly
-  stale stored snapshot, so fit-score changes (e.g. a firmographic data
-  correction) get attributed too, not just activity.
-- Any leftover, unattributed delta is bucketed as "other adjustments" rather
-  than silently dropped — so the numbers always reconcile exactly. This was
-  a conscious testability requirement: I have a test that asserts
-  `sum(driver.points for driver in drivers) == actual_delta` for the hero
-  account.
+**Recency (20): how fresh is the latest meaningful signal?**
+- ≤ 24h = 20 · ≤ 3 days = 15 · ≤ 7 days = 10 · ≤ 14 days = 5 · older = 0.
+- A step function rather than smooth decay, for interpretability: "recency
+  is 15 because the last real activity was 2 days ago" fits in a tooltip.
+- **Email opens never count for recency.** Privacy proxies (such as Apple
+  Mail Privacy Protection) auto-open tracking pixels, so an open is not
+  proof a human was there.
 
-If asked "why does this matter" — because a sales rep who sees "+25" with no
-explanation doesn't trust it, but "+25, and here are the four exact reasons,
-each with a timestamp" is something they'll act on immediately.
+**Rules that apply to every signal:**
+- Only the **last 30 days** count for intent and engagement.
+- **Per-type caps** stop repetition from dominating (the bot-spam preset:
+  240 signals, score 41).
+- **Future timestamps** (more than 5 minutes ahead, to allow for clock
+  skew) are excluded and flagged.
+- **Duplicates** are removed by fingerprint.
+
+**"How did you pick 80/50?"** Honest answer: "Reasonable, configurable
+defaults for a demo. In production I'd back-test thresholds against real
+win rates by score decile."
 
 ---
 
-## 5. The AI grounding strategy — expect deep questions here
+## 7. "What changed?": the most technically interesting part
 
-This is the part most likely to get grilled, because "how do you stop the
-LLM from hallucinating" is the classic AI-integration interview question.
+The naive version diffs two numbers. This version does **exact
+attribution**: every point of the delta is assigned to a named driver, and
+the drivers **sum exactly to the real delta**.
 
-**Layers of defense, in order:**
+**How it works:**
 
-1. **Structured input only.** The model never sees free text or the raw
-   database — it receives a strict JSON payload I construct server-side:
-   account facts, the score breakdown, up to 15 real recent activities, the
-   real contact list, and the *already-computed* deterministic next action.
-   It cannot invent data it was never given.
-2. **Explicit negative instructions in the system prompt** — a hard list:
-   "Do NOT invent people, activities, company facts, product usage, pricing,
-   previous conversations, business outcomes, or customer requirements." I
-   also require it to write a fixed phrase — *"Insufficient evidence from
-   available account signals"* — whenever a field isn't supported by the
-   data, rather than guessing.
-3. **The model is told its own output must be *consistent* with the
-   deterministic next action**, not free to invent its own recommendation.
-   I pass `deterministicNextAction` into the prompt explicitly.
-4. **Post-generation validation (code, not prompting).** If the account
-   genuinely has zero contacts, I overwrite `recommendedPersona` server-side
-   regardless of what the model said, so even if it ignored the prompt and
-   named a fictional VP, the UI never shows it. This is the most important
-   lesson: **prompting is a request, not a guarantee — the only real
-   safety net is deterministic code that runs after the model.**
-5. **Robust parsing, not blind trust.** The model's response has to survive
-   markdown code fences, leading prose ("Here's the analysis:"), snake_case
-   vs. camelCase key drift, and even `<think>` reasoning blocks some models
-   emit — I strip/parse all of that defensively before validating it against
-   a Pydantic schema.
-6. **The UI never lets AI content masquerade as fact.** Every AI section is
-   visually labeled "AI-generated analysis" and sits next to, never
-   replacing, the deterministic score and action panel.
+1. **Pick the comparison point:** the most recent stored snapshot that is
+   **at least 24 hours old** (ties broken by id, so it's deterministic).
+2. **Recompute components at that moment** with the same scoring function,
+   then attribute:
+   - **Fit change:** fit now − fit then (e.g. an employee count correction).
+   - **Recency change:** recency now − recency then.
+   - **New signals:** replay the new activities **in chronological order**
+     and credit each one with the **marginal** intent + engagement points it
+     added. Order matters because of caps: if two pricing views already
+     count, a third gets **0 points**, and it still appears in the timeline
+     marked "limited by score caps" instead of vanishing.
+   - **Aged-out signals:** activity that fell out of the 30-day window
+     since then, which can pull the score *down* even when new activity
+     arrived.
+   - **Other adjustments:** any residual against the stored snapshot (e.g.
+     a rule change), so the numbers always reconcile rather than silently
+     drifting.
+3. A test asserts `sum(driver.points) == delta` for the hero account.
 
-**Failure handling** — be ready to list the specific failure modes I coded
-for, because "did you actually handle X or just say you did" is a common
-gotcha: missing API key, HTTP 401/403 (bad key), 402 (no credits), 429 (rate
-limit, retried once with backoff), 5xx (retried once), network/timeout
-errors, empty completion text, non-JSON completion text, JSON that's missing
-required fields, and JSON that has the right fields but the wrong types. All
-of these collapse to a single response shape: `status: "unavailable"` with an
-`errorCode`, HTTP 200 (not 500 — the endpoint didn't fail, the AI feature
-degraded), and the UI shows: *"AI analysis is currently unavailable. Account
-scoring and deterministic recommendations are still available."*
+**Why it matters:** a rep who sees "+25" with no reason doesn't trust it.
+"+25, here are the four reasons, each with a timestamp" is something they
+act on.
 
 ---
 
-## 6. Be ready to explain the Next-Best-Action rules engine as an actual decision tree
+## 8. The AI grounding strategy: expect deep questions
 
-Say it as an ordered priority list, because that's literally how it's coded
-(first matching rule wins):
+"How do you stop the LLM from hallucinating?" is the classic question.
+Answer with layers:
 
-1. No activity in the last 30 days → **Monitor** (nothing to act on yet).
-2. A demo was explicitly requested → **Schedule Demo**, targeted at the
-   actual requester if their contact metadata is present, otherwise the best
-   available decision-maker.
-3. Score is HIGH and Intent ≥ 15 and a decision-maker contact exists →
-   **Contact Decision-Maker** by name and title.
-4. Same situation but *no* decision-maker on file → falls back to **Send
-   Personalized Email** to the best available contact, and the UI explicitly
-   surfaces *"No decision-maker persona identified"* rather than pretending
-   one exists.
-5. Medium engagement/intent but not yet urgent → **Send Personalized
-   Email**.
-6. Very thin, low-value signal only → **Monitor**.
-7. Everything else weak → **Nurture Account**.
+1. **Structured input only.** The model never sees the database or free
+   text: it gets a JSON payload built server-side from facts that were
+   already computed. It can't cite data it was never given.
+2. **Explicit negative rules in the system prompt:** do not invent people,
+   titles, activities, company facts, product usage, pricing, past
+   conversations or outcomes. When a field isn't supported, write exactly
+   *"Insufficient evidence from available account signals."*
+3. **Consistency with the rules engine:** the prompt includes
+   `deterministicNextAction` and requires the AI's recommendation to agree
+   with it.
+4. **Post-generation checks in code.** If the account has no contacts, the
+   backend overwrites `recommendedPersona`, whatever the model said.
+   *Prompting is a request, not a guarantee; the real safety net is code
+   that runs after the model.*
+5. **Defensive parsing.** Handles code fences, leading prose, snake_case vs
+   camelCase keys, and `<think>` reasoning blocks, then validates with a
+   Pydantic schema.
+6. **Honest UI.** AI content is labelled "AI-generated analysis" and sits
+   *next to* the deterministic score and action, never replacing them.
 
-The interesting engineering point: **every branch has an explicit "what if
-the ideal data is missing" fallback** — no contacts, no decision-maker, no
-activity at all — because real CRM data is never clean, and a demo that only
-works on the happy path isn't a demo of production thinking.
+**Failure handling, name them specifically:** missing key, 401/403 (bad
+key), 402 (no credits), 429 (rate limit), 5xx and network/timeout errors
+(retried once), empty reply, non-JSON reply, JSON missing required fields,
+wrong types. All of them return **HTTP 200** with `status: "unavailable"`
+and an `errorCode`. The endpoint didn't fail; one feature degraded. The UI
+says: *"AI analysis is currently unavailable. Account scoring and
+deterministic recommendations are still available."*
 
----
-
-## 7. Persona mapping and contact ranking — a smaller but good talking point
-
-Job titles are free text in the real world ("VP, Engineering" vs "VP
-Engineering" vs "Vice President of Engineering"), so I mapped titles to five
-personas (Technical Evaluator, Economic Buyer, Executive Sponsor, Influencer,
-Procurement) using ordered regex rules, not exact string matching. Contacts
-are then ranked by a weighted score: persona importance, **plus a large boost
-if that contact's name/email actually appears in recent activity metadata**
-(meaning they personally engaged) — so an engaged Engineering Manager can
-rank above an unengaged CFO. This is a small piece but it shows I thought
-about "ranking," not just "categorizing."
-
----
-
-## 8. Product-interest inference — explain the honesty mechanism
-
-Rather than always guessing a product, I require a **minimum evidence
-threshold** (a point total *and* a minimum number of distinct signals) before
-committing to a product, and I explicitly check for **ties** between the top
-two candidates. Below threshold or on a tie → the UI shows *"Insufficient
-signals"* rather than a low-confidence guess. This mirrors the same
-philosophy as everything else in the app: **silence is better than a
-confident-sounding wrong answer.**
+**Security:** the OpenRouter key exists only in the backend's environment
+(a secret on Render; a local env var in development). It's never in the
+repo, never in the React bundle, and `/api/health` reports only whether a
+key is configured, never the key itself.
 
 ---
 
-## 9. Edge cases — have 3–4 memorized cold, don't just say "I handled edge cases"
+## 9. The next-best-action rules engine
 
-Pick whichever land best for your audience:
+It's an ordered list, and the first matching rule wins:
 
-- **Duplicate activities:** the database has a unique constraint on a hash
-  of (account, type, timestamp, metadata) — so literally the same event
-  can't be double-counted even if an upstream integration retries a webhook.
-  I tested this at both the DB layer (IntegrityError) and the scoring-engine
-  layer (defensive dedup even if duplicates somehow got stored).
-- **Future timestamps:** a demo dataset had a data-quality bug I deliberately
-  kept in (Nimbus Education has a demo request dated in the future) to prove
-  the app doesn't let bad upstream data give an account artificial recency
-  points — it's excluded from scoring and flagged with a warning banner.
-- **Score boundary tests:** I stress-tested with hundreds of stacked
-  high-value activities to prove the total mathematically cannot exceed 100
-  or go below 0, regardless of how much (fake or real) activity floods in.
-- **Missing optional data:** an account with no website, no employee count,
-  and a contact with no job title still renders a complete, non-broken page
-  — every "unknown" field has a specific, honest microcopy string instead of
-  `null`, `undefined`, or a blank space.
+1. No activity in the last 30 days → **Monitor**.
+2. A demo was requested → **Schedule demo**, targeted at the requester if
+   known, otherwise the best decision-maker.
+3. HIGH score, strong intent, and a decision-maker on file → **Contact
+   decision-maker** by name and title.
+4. Same, but *no* decision-maker → **Send personalized email** to the best
+   available contact, and the UI says *"No decision-maker persona
+   identified"* instead of pretending.
+5. Medium engagement or intent → **Send personalized email**.
+6. Everything weaker → **Nurture account**, or **Monitor** when the signal
+   is very thin.
 
----
-
-## 10. Testing story — say the number, then say *what kind* of tests
-
-"113 backend tests, all passing, no network calls to the real AI provider in
-the test suite — I use `monkeypatch` to inject failures at the exact seam
-where the AI call happens, so I can assert the fallback behavior for every
-one of those ~10 failure modes without ever needing a live API key in CI."
-Categories: scoring math (exact expected values, not just "score > 0"),
-edge cases, recommendation branches, AI grounding/parsing/fallback, and full
-API-level tests (status codes, 404s on invalid IDs, 409s on duplicate
-activity posts).
-
-Be precise about the frontend: the 113 automated tests are **backend**
-tests. I verified the UI end to end by driving it in a real Chrome browser
-with scripted checks (every filter, sort, dialog, the AI fallback, mobile
-width, no console errors). Those scripts aren't part of the repo, so don't
-claim a committed frontend test suite. If asked, say adding Playwright tests
-to CI is the obvious next step.
+**The engineering point:** every branch has a fallback for missing data (no
+contacts, no decision-maker, no activity), because real CRM data is never
+clean.
 
 ---
 
-## 11. Frontend/architecture talking points
+## 10. Persona mapping and contact ranking
+
+Job titles are messy ("VP, Engineering", "VP Engineering", "Vice President
+of Engineering"), so ordered regex rules map them to five personas:
+Technical Evaluator, Economic Buyer, Executive Sponsor, Influencer,
+Procurement. Contacts are then **ranked**: persona importance plus a large
+boost if that person **personally engaged** recently (found in activity
+metadata). So an engaged engineering manager can outrank an unengaged CFO.
+The point: *ranking*, not just categorizing.
+
+---
+
+## 11. Product-interest inference: the honesty mechanism
+
+A product is only named if the evidence passes a **minimum threshold**
+(points and number of distinct signals) and the top two candidates are
+**not tied**. Otherwise the UI shows *"Insufficient signals."* Same
+philosophy as everywhere else: *silence beats a confident wrong answer.*
+
+---
+
+## 12. Edge cases: have 3–4 memorized cold
+
+- **Duplicate activities:** a unique database constraint on a fingerprint
+  of (account, type, timestamp, metadata) means a retried webhook can't
+  double-count. The API returns 409. The scorer also dedupes defensively.
+- **Future timestamps:** Nimbus Education deliberately has a demo request
+  dated in the future. It's excluded from scoring and flagged, so bad
+  upstream data can't fake recency.
+- **Score bounds:** hundreds of stacked signals can't push the total above
+  100 or below 0.
+- **Missing data:** an account with no website, no employee count, or a
+  contact with no title still renders a complete page with honest copy
+  instead of `null` or blanks.
+- **No activity / no contacts:** Cobalt Security Labs and Lumen Media Co
+  show clean empty states and sensible actions.
+
+---
+
+## 13. Testing story: say the number, then the kind
+
+"113 backend tests, all passing, and none of them call the real AI
+provider. I monkeypatch the single function that makes the HTTP call, so I
+can simulate every failure mode without a live key."
+
+Categories: exact scoring math, edge cases, every recommendation branch,
+What Changed reconciliation, AI parsing/grounding/fallback, and API tests
+(status codes, 404 on unknown ids, 409 on duplicates).
+
+**Be precise about the frontend:** the 113 automated tests are backend
+tests. I verified the UI end to end in a real Chrome browser with scripted
+checks (filters, sorting, dialogs, the AI fallback, mobile width, no
+console errors), but those scripts aren't in the repo. The obvious next
+step is Playwright tests in CI.
+
+---
+
+## 14. Frontend and architecture talking points
 
 **Stack and structure**
 - React + TypeScript + Vite, plain CSS with light/dark theme tokens (no UI
-  framework dependency), a deliberate choice to show CSS fundamentals
-  rather than lean entirely on a component library.
-- Recharts for the score history, activity trend and the clickable score
-  breakdown. Colors come from CSS variables, so dark mode works without
-  duplicating chart code, and the chart palette follows a validated,
-  colorblind-safe order.
-- The Vite dev server proxies `/api/*` to FastAPI, so the browser **never
-  talks to OpenRouter and never sees the API key**.
-- Routing is a ~20-line custom hook on the History API (`/`, `/accounts`,
-  `/accounts/:id`) instead of react-router: three routes don't justify a
-  dependency.
+  framework): a deliberate choice to show CSS fundamentals.
+- Recharts for score history, activity trend and the clickable breakdown.
+  Colours come from CSS variables, so dark mode needs no duplicate chart
+  code.
+- The browser only ever calls `/api/*` on its own origin. Locally Vite
+  proxies that to FastAPI; in production Vercel rewrites it to Render. The
+  browser **never talks to OpenRouter and never sees the key**.
+- Routing is a ~20-line hook on the History API (`/`, `/accounts`,
+  `/accounts/:id`): three routes don't justify react-router.
 
-**The Overview page and simulator (expect a question here)**
+**The Overview page and simulator**
 - The Overview page exists to show *product understanding*: the problem, a
-  7-step pipeline walkthrough fed by **live** backend data, design
-  principles, architecture and edge cases.
-- The score simulator runs a **client-side mirror** of the backend rules
-  (`frontend/src/services/scoringModel.ts`) so it can respond instantly
-  while you toggle inputs. Its presets reproduce the real engine's numbers
-  exactly (Acme 61 → 86). See the "why duplicate the logic" question in
-  section 12.
+  7-step pipeline walkthrough fed by live backend data, design principles,
+  architecture and edge cases.
+- The simulator runs a **client-side mirror** of the scoring rules
+  (`frontend/src/services/scoringModel.ts`) so it responds instantly. Its
+  presets reproduce the real engine exactly (Acme 61 → 86). See the "why
+  duplicate the logic" question in section 16.
 
-**Interaction engineering (good for "tell me about the frontend")**
-- **Animated re-sorting** uses the FLIP technique: measure row positions
-  before and after a re-sort, then animate the difference with the Web
-  Animations API. No animation library needed.
-- **Hover previews** fetch account intelligence lazily after a short hover
-  delay and cache it per session. The cache is cleared whenever a new signal
-  is logged, so previews never go stale.
-- **Cross-component interactions** (click a "What changed?" driver → the
-  timeline scrolls to and highlights that event; click *Intent* in the
-  header → the breakdown selects that tab) use a small typed event bus
-  instead of prop-drilling through the page.
+**Interaction engineering**
+- **Animated re-sorting** with the FLIP technique: measure row positions
+  before and after, animate the difference with the Web Animations API.
+- **Hover previews** load lazily after a short delay and are cached; the
+  cache clears when a new signal is logged.
+- **Cross-component links** (click a What Changed driver → the timeline
+  scrolls to that event) use a small typed event bus instead of
+  prop-drilling.
 - **Command palette** (Ctrl+K) with fuzzy matching and full keyboard
-  navigation; `/` focuses the table search.
-- **Accessibility and polish**: skeleton loaders that match the real layout,
-  toasts in an `aria-live` region, priority shown as icon + text (never color
-  alone), `prefers-reduced-motion` honoured, and a tiny inline script that
-  applies the saved theme before first paint so there's no light/dark flash.
+  support; `/` focuses the search.
+- **Accessibility and polish:** skeleton loaders, toasts in an `aria-live`
+  region, priority as icon + text (never colour alone),
+  `prefers-reduced-motion` honoured, and an inline script that applies the
+  saved theme before first paint so there's no flash.
 
 ---
 
-## 12. Hard questions to pre-empt
+## 15. Deployment: how it runs without my laptop
 
-**"Isn't this just if/else statements, not real 'AI'?"**
-> "The scoring and recommendation logic is deterministic by design — that's
-> the point, not a limitation. The AI is genuinely doing what LLMs are
-> uniquely good at: reading structured evidence and producing fluent,
-> personalized natural language. If I'd used an LLM for the scoring, I'd
-> have a less trustworthy, less testable, slower, and more expensive product
-> for no real benefit — the *judgment* of where to apply AI is the point I
-> want this project to demonstrate."
+```
+GitHub (main) ──push──► Vercel  builds frontend/ → static site + /api rewrite
+              └──push──► Render  builds backend/  → FastAPI (render.yaml Blueprint)
+```
 
-**"What would you change for a real production version?"**
-> "Three things: (1) replace the step-function recency score with a
-> back-tested decay curve calibrated against real win/loss data instead of
-> my own defaults, (2) move from SQLite to Postgres with proper migrations
-> (Alembic) and add authentication/multi-tenancy, (3) add a feedback loop —
-> let reps thumbs-up/down the AI's outreach draft and log that, since that's
-> the actual signal you'd use to improve prompt quality over time."
+- **Frontend on Vercel:** root directory `frontend`. `frontend/vercel.json`
+  rewrites `/api/*` to the Render backend and everything else to
+  `index.html`, so deep links like `/accounts/1` work on refresh.
+- **Backend on Render:** defined as code in `render.yaml` (Python 3.12,
+  health check `/api/health`). Secrets (`OPENROUTER_API_KEY`) are entered
+  in the Render dashboard, never committed.
+- **Free-tier trade-offs, stated honestly:** the backend sleeps after ~15
+  minutes idle (30–60s cold start), and the disk is ephemeral, so
+  `AUTO_SEED=true` reloads the demo data on each start. Signals logged in
+  the demo last until the next restart. For persistence: Postgres or a paid
+  disk.
+- **Continuous deployment:** every push to `main` redeploys both.
+
+**Why not host the backend on Vercel too?** Vercel runs Python as
+serverless functions with no persistent local disk, so SQLite would reset
+between invocations. Render runs a normal long-lived server.
+
+**Deployment bug story (good real example):** the deployed site loaded but
+showed no data. I debugged it layer by layer:
+1. The deployment URL returned Vercel's **login page**: deployment
+   protection was on. Disabled it for the project.
+2. The backend returned no **CORS** header for the site's origin. I made
+   origin matching tolerant of trailing slashes and allowed this project's
+   Vercel domains.
+3. The built JavaScript contained no backend URL: the build-time variable
+   `VITE_API_BASE_URL` wasn't set, so the app called `/api` on Vercel and
+   got HTML back. Instead of relying on that variable, I added a Vercel
+   **rewrite** from `/api/*` to Render. Now the browser calls its own
+   origin, so there's no CORS in the normal path and no build-time config
+   to forget.
+Each step was verified from the command line (page title, CORS header,
+inspecting the built bundle) before moving to the next.
+
+---
+
+## 16. Hard questions to pre-empt
+
+**"Isn't this just if/else statements, not real AI?"**
+> "The scoring and recommendations are deterministic by design; that's the
+> point, not a limitation. The AI does what LLMs are uniquely good at:
+> reading structured evidence and writing fluent, personalized language.
+> Using an LLM for scoring would give a less trustworthy, less testable,
+> slower and more expensive product. Choosing where to apply AI is the
+> judgment this project demonstrates."
+
+**"What would you change for production?"**
+> "(1) Calibrate weights and recency against real win/loss data instead of
+> my defaults. (2) Postgres with Alembic migrations, plus authentication
+> and multi-tenancy. (3) A feedback loop: reps rate the AI's drafts, which
+> is the signal you'd use to improve prompts over time."
 
 **"How would this scale to 100,000 accounts?"**
-> "The scoring function is pure and O(n) in activity count per account, so
-> it's already cheap — I'd move it to a scheduled batch job (nightly or
-> event-triggered on new-activity webhooks) writing score snapshots, instead
-> of recomputing on every page load like the demo does. The AI call is the
-> expensive part, so that stays on-demand, per-rep-click, never batch — you
-> don't want to burn LLM spend analyzing accounts nobody's looking at."
+> "Scoring is a pure function, linear in the number of activities per
+> account, so it's already cheap. I'd move it to a batch or event-driven
+> job that writes snapshots, instead of recomputing on page load. The AI
+> call is the expensive part, so it stays on demand, per click: no point
+> paying to analyze accounts nobody's looking at."
 
 **"Why SQLite and not Postgres?"**
-> "Zero-setup for a take-home/demo context — anyone can clone this and run
-> it with no external service. The schema and SQLAlchemy layer don't assume
-> SQLite-specific features, so swapping the connection string to Postgres is
-> close to a one-line change."
+> "Zero setup for a demo: clone and run. Nothing in the SQLAlchemy layer is
+> SQLite-specific, so switching is close to a one-line connection-string
+> change."
 
-**"Why does the simulator duplicate the scoring logic in the frontend? Isn't that drift waiting to happen?"**
-> "Yes, and I'd say that's the honest trade-off. The simulator needs to
-> react on every click, and it's an explainer, not the product: every real
-> score shown anywhere else comes from the backend. I kept the mirror small
-> and table-driven and checked it against the backend's actual numbers
-> (the Acme presets reproduce 61 and 86 exactly). In production I'd remove
-> the duplication by either exposing a `POST /api/score/simulate` endpoint
-> that runs the real engine, or by serving the rule tables from the backend
-> as JSON so both sides read one source of truth, plus a test that fails if
-> they diverge."
+**"Why does the simulator duplicate the scoring logic in the frontend?"**
+> "It's a deliberate trade-off. The simulator must respond on every click,
+> and it's an explainer, not the product: every real score comes from the
+> backend. I kept the mirror small and table-driven and checked it against
+> the backend (the Acme presets reproduce 61 and 86 exactly). In production
+> I'd remove the duplication with a `POST /api/score/simulate` endpoint or
+> by serving the rule tables as JSON, plus a test that fails if they
+> diverge."
 
-**"Tell me about a bug you hit and how you debugged it."**
-> Pick one; all three are real:
-> - **The invisible tooltip.** The hover preview passed its check but never
->   showed up on screen. I measured its actual position and walked up its
->   parent elements: a card's entrance animation left a `transform` on it,
->   and a transformed parent redefines what `position: fixed` is relative
->   to. So the card was being drawn about 600px lower than intended. The fix
->   was rendering the preview and dialog through a React portal on
->   `document.body`, then measuring the real card height before deciding
->   whether to open it above or below the row.
-> - **AI calls failing with a "network error" while curl worked.** The real
->   error was a TLS certificate verification failure: this machine's root
->   certificate lives in the Windows certificate store, which curl uses but
->   Python's bundled CA list doesn't. I fixed it with `truststore`, so Python
->   verifies against the OS trust store. Certificate verification stays on;
->   I never disabled it.
-> - **A duplicated score snapshot.** Posting an activity created two history
->   points instead of one. Two snapshots shared the same timestamp and
->   `max()` picked the older one, so the code thought the score had changed
->   again. I fixed it with an explicit tie-break on id.
+**"Tell me about a bug you hit and how you debugged it."** Pick one; all are
+real:
+> - **The invisible tooltip.** The hover preview never appeared on screen.
+>   A card's entrance animation left a `transform` on a parent, and a
+>   transformed parent changes what `position: fixed` is relative to, so
+>   the preview was drawn ~600px too low. Fix: render it through a React
+>   portal on `document.body` and measure its real height before placing
+>   it.
+> - **AI calls failing with "network error" while curl worked.** It was a
+>   TLS verification failure: the machine's root certificate was in the
+>   Windows store, which curl uses but Python's bundled CA list doesn't.
+>   Fixed with `truststore` so Python uses the OS trust store; verification
+>   stayed on.
+> - **A duplicated score snapshot.** Logging one activity created two
+>   history points: two snapshots shared a timestamp and `max()` picked the
+>   older one. Fixed with an explicit tie-break on id.
+> - **The deployed site showing no data.** See section 15: login wall →
+>   CORS → missing build-time URL, fixed with a Vercel rewrite.
 
 **"What was the hardest part?"**
-> Good honest answer: "Getting the 'What Changed' attribution to mathematically
-> reconcile — handling per-type score caps, the 30-day rolling window, and
-> signals aging out, while still producing a clean list of human-readable
-> reasons that sum exactly to the real delta. It's the kind of feature that
-> looks simple in the UI but has real interaction-effect complexity
-> underneath, and I think that gap — between what looks simple and what
-> engineering that simplicity actually took — is exactly what's worth
-> talking about in an interview."
+> "Making What Changed reconcile exactly: per-type caps, the 30-day window
+> and signals aging out, while still producing a short list of
+> human-readable reasons that sum to the real delta. It looks simple in the
+> UI, and the gap between how simple it looks and what it took is exactly
+> what's worth talking about."
 
 ---
 
-## 13. If they ask you to whiteboard/extend it live
+## 17. If they ask you to extend it live
 
-Good, safe things to sketch on request:
-- "Add a new signal type" → show it only needs an entry in
-  `INTENT_POINTS`/`ENGAGEMENT_POINTS` plus a per-type cap, no other code
-  changes — demonstrates the scorer is table-driven, not hardcoded per-type.
-  Be upfront that today you'd also add it to the simulator's mirror table
-  (`scoringModel.ts`) and the "Log a signal" dialog, which is exactly why a
-  single shared rules source is on the improvement list.
-- "Add a new next-best-action" → walk through inserting a new branch in the
-  ordered rule list, and note you'd add a test asserting it doesn't shadow
-  an earlier, higher-priority rule.
-- "How would you A/B test scoring weights?" → store the weight config as
-  data (already halfway there — it's a few constants at the top of
-  `scoring.py`), version it, and log which config produced which score per
-  account so you can compare cohorts.
+- **"Add a new signal type"** → add an entry to `INTENT_POINTS` or
+  `ENGAGEMENT_POINTS` and its cap in `scoring.py`; the scorer is
+  table-driven. Be upfront that you'd also update the simulator mirror
+  (`scoringModel.ts`) and the Log-a-signal dialog, which is why a single
+  shared rules source is on the improvement list.
+- **"Add a new next-best-action"** → insert a branch in the ordered rule
+  list in `recommendations.py`, and add a test proving it doesn't shadow a
+  higher-priority rule.
+- **"How would you A/B test scoring weights?"** → store the weights as
+  versioned config (they're already constants at the top of `scoring.py`),
+  log which version produced each score, and compare conversion by cohort.
+
+---
+
+## 18. Cheat sheet
+
+| Thing | Value |
+|---|---|
+| Score | Fit 30 + Intent 30 + Engagement 20 + Recency 20 = 100 |
+| Priority | HIGH ≥ 80 · MEDIUM 50–79 · LOW < 50 |
+| Fit | +15 target industry · +15 for 200–5,000 employees |
+| Biggest signals | Demo request 15 · Pricing view 8 · Decision-maker engagement 8 |
+| Recency | ≤24h 20 · ≤3d 15 · ≤7d 10 · ≤14d 5 · else 0 (email opens excluded) |
+| Signal window | 30 days · future tolerance 5 minutes |
+| What Changed baseline | latest snapshot ≥ 24h old |
+| Hero account | Acme Technologies 61 → 86 (+25) |
+| Live-demo account | Keystone: 17 → 52 (+35) after a demo request |
+| Bot-spam preset | 240 signals → score 41 |
+| Demo data | 15 accounts · 26 contacts · 107 activities |
+| Tests | 113 backend (pytest), no live AI calls |
+| AI | OpenRouter `openrouter/free`, retry once, failures → HTTP 200 `unavailable` |
+| Stack | React · TypeScript · Vite · Recharts / FastAPI · Pydantic · SQLAlchemy · SQLite |
+| Hosting | Vercel (frontend + `/api` rewrite) · Render (backend, `render.yaml`) |
