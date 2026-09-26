@@ -44,6 +44,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().cors_origins,
+    # Vercel production + preview URLs for this project (read-only demo data, no cookies).
+    allow_origin_regex=r"https://account-intelligence[a-z0-9-]*\.vercel\.app",
     allow_methods=["*"],
     allow_headers=["*"],
 )

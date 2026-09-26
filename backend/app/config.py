@@ -45,7 +45,7 @@ def get_settings() -> Settings:
         openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         openrouter_timeout_seconds=float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "45")),
         cors_origins=[
-            o.strip()
+            o.strip().rstrip("/")
             for o in os.getenv(
                 "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
             ).split(",")
