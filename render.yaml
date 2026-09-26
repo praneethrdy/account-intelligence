@@ -1,0 +1,29 @@
+# Render Blueprint: deploys the FastAPI backend.
+# In Render: New → Blueprint → connect this repo. You will be asked for
+# OPENROUTER_API_KEY (kept secret, never committed).
+services:
+  - type: web
+    name: account-intelligence-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      # The free plan has no persistent disk, so the SQLite database starts
+      # empty on every deploy/restart; AUTO_SEED reloads the demo data.
+      - key: AUTO_SEED
+        value: "true"
+      - key: OPENROUTER_MODEL
+        value: openrouter/free
+      - key: OPENROUTER_API_KEY
+        sync: false
+      # Set both to your Vercel URL after the frontend is deployed,
+      # e.g. https://account-intelligence.vercel.app
+      - key: CORS_ORIGINS
+        sync: false
+      - key: APP_URL
+        sync: false
